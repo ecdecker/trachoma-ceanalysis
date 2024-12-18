@@ -1,0 +1,438 @@
+---
+title: "Mozambique Sensitivity Analyses"
+author: "Emily Decker"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+library(knitr)
+options(tidyverse.quiet = TRUE)
+library(tidyverse)
+library(readxl)
+library(scales)
+library(lhs)
+library(mc2d)
+library(foreach)
+library(ggplot2)
+library(quantreg)
+
+setwd("C:/Users/edecker/OneDrive - Research Triangle Institute/NTD Costing")
+model_inputs <- "Model inputs/Enhanced TIS sensitivity analysis inputs.xlsx"
+model_file_path <- "Model inputs/temp/"
+```
+
+Set up functions
+```{r functions, include = FALSE}
+sens_data <- read_excel(model_inputs, sheet = "moz_point_estimates")
+
+#Create icer function
+calculate_icer <- function(df) {
+  df$c_test = df$c_pd+df$c_travel+df$c_sup
+  df$cost = df$accept*(df$c_test+df$c_treat * ((df$preval*df$sens)+((1-df$preval)*(1-df$spec))))
+  df$effect = df$accept*df$preval*df$sens
+  
+  cost_grading = df$cost[df$study_arm == "grading"]
+  cases_grading = df$effect[df$study_arm == "grading"]
+  
+  df$incremental_cost = df$cost - cost_grading
+  df$incremental_effect = df$effect - cases_grading
+  df$icer = df$incremental_cost/df$incremental_effect
+  
+  df
+}
+
+icer <- calculate_icer(sens_data)
+icer_local <- calculate_icer(sens_data_scenario)
+
+#reshape long
+sens_data_edit <- sens_data %>%
+  pivot_longer(cols = 2:9,
+               names_to = "parameter")
+
+```
+
+```{r local scenario analysis, include = FALSE}
+sens_data_scenario <- read_excel(model_inputs, sheet = "moz_point_estimates_local") #for local lab testing scenario analysis
+
+#Create icer function
+calculate_icer_local <- function(df) {
+  df$cost = df$accept*(df$c_test+df$c_treat * ((df$preval*df$sens)+((1-df$preval)*(1-df$spec))))
+  df$effect = df$accept*df$preval*df$sens
+  
+  cost_grading = df$cost[df$study_arm == "grading"]
+  cases_grading = df$effect[df$study_arm == "grading"]
+  
+  df$incremental_cost = df$cost - cost_grading
+  df$incremental_effect = df$effect - cases_grading
+  df$icer = df$incremental_cost/df$incremental_effect
+  
+  df
+}
+
+icer_local <- calculate_icer_local(sens_data_scenario)
+
+```
+
+```{r values, include = FALSE}
+#create range of values for each parameter
+model_ranges <- sens_data_edit %>%
+  mutate(min=value*(0.7)) %>%
+  mutate(max=ifelse(grepl("c_",parameter),value*(1.5),ifelse(value*(1.1)>1,1,value*(1.1)))) %>%
+  mutate(min=ifelse(parameter=="preval", 0.002, min),
+         max=ifelse(parameter=="preval", 0.1, max),
+         min=ifelse(parameter=="c_treat", 0.63, min),
+         max=ifelse(parameter=="c_treat", 0.94, max))
+
+model_ranges$study_arm_param <- paste(model_ranges$study_arm, model_ranges$parameter, sep = "_")
+
+
+```
+
+Deterministic Sensitivity Analysis
+```{r dsa, include = FALSE}
+model_params_dsa <- as.data.frame(model_ranges)
+model_params_point <- as.data.frame(model_ranges)
+dsa_output <- vector(mode = "list", length = 2 * nrow(model_params_dsa))
+
+names(dsa_output) <- paste(rep(model_params_dsa$study_arm_param, each = 2),
+                           rep(c("min", "max"), times = nrow(model_params_dsa)),
+                           sep = "_")
+
+for (i in 1:nrow(model_params_dsa)) {
+  for (j in c("min", "max")) {
+    # pull in point version as baseline
+    model_params_dsa_for_run <- model_params_point
+    # for the parameter of interest, reset the value
+    model_params_dsa_for_run$value[model_params_dsa_for_run$study_arm_param == 
+                                     model_params_dsa$study_arm_param[i]] <- 
+      model_params_dsa[i, j]
+    
+    dsa_name <- paste(model_params_dsa$study_arm_param[i], j, sep = "_")
+    
+    model_params_dsa_for_run <- select(model_params_dsa_for_run, study_arm, parameter, value) %>%
+      pivot_wider(names_from = parameter, values_from = value) %>%
+      as.data.frame()
+    
+    dsa_model <- calculate_icer(model_params_dsa_for_run)
+    
+    dsa_model$dsa_name <- dsa_name
+    dsa_output[[dsa_name]] <- dsa_model
+    
+  }
+}
+
+dsa_final <- do.call(rbind, dsa_output)
+
+dsa_final$bound <- ifelse(grepl("max", dsa_final$dsa_name), "max", "min")
+dsa_final$param[grepl("accept",dsa_final$dsa_name)]<-"Acceptability"
+dsa_final$param[grepl("preval",dsa_final$dsa_name)]<-"Prevalence"
+dsa_final$param[grepl("sens",dsa_final$dsa_name)]<-"Sensitivity"
+dsa_final$param[grepl("spec",dsa_final$dsa_name)]<-"Specificity"
+dsa_final$param[grepl("c_pd",dsa_final$dsa_name)]<-"Per Diem Costs"
+dsa_final$param[grepl("c_travel",dsa_final$dsa_name)]<-"Travel Costs"
+dsa_final$param[grepl("c_sup",dsa_final$dsa_name)]<-"Supplies/Equipment Costs"
+dsa_final$param[grepl("c_treat",dsa_final$dsa_name)]<-"Cost of Treatment"
+
+dsa_final$study_arm <- ifelse(dsa_final$study_arm == "swab_dbs", "swabdbs", dsa_final$study_arm)
+dsa_final$study_arm_name[grepl("grading",dsa_final$dsa_name)]<-"grading"
+dsa_final$study_arm_name[grepl("swab\\_",dsa_final$dsa_name)]<-"swab"
+dsa_final$study_arm_name[grepl("^dbs",dsa_final$dsa_name)]<-"dbs"
+dsa_final$study_arm_name[grepl("swab_dbs",dsa_final$dsa_name)]<-"swabdbs"
+
+dsa_final <- subset(dsa_final, study_arm_name==study_arm)
+
+```
+
+DSA Cost-Effectiveness Plane
+```{r dsa graphs}
+##Figure 2
+icer_plot_accept <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Acceptability")
+icer_plot_preval <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Prevalence")
+icer_plot_sens <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Sensitivity")
+icer_plot_spec <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Specificity")
+icer_plot_cpd <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Per Diem Costs")
+icer_plot_ctrav <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Travel Costs")
+icer_plot_csup <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Supplies/Equipment Costs")
+icer_plot_ctreat <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Cost of Treatment")
+icer_plot_ccom <- icer %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm,  incremental_cost, incremental_effect, icer) %>%
+  mutate(incremental_cost = 0, incremental_effect = 0, icer = 0) %>% 
+  mutate(study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound = "Base Value",
+         param = "Communication Costs")
+
+dsa_plot <- dsa_final %>%
+  filter(study_arm!="grading") %>%
+  select(study_arm, bound, param,  incremental_cost, incremental_effect, icer) %>%
+  mutate(study_arm=if_else(study_arm=="swabdbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm),
+         study_arm=if_else(study_arm=="dbs", "DBS", study_arm)) %>%
+  mutate(bound=if_else(bound=="max", "Maximum", bound),
+         bound=if_else(bound=="min", "Minimum", bound))
+row.names(dsa_plot) <- NULL
+
+dsa_plot <- rbind(dsa_plot, icer_plot_accept, icer_plot_cpd, icer_plot_csup, icer_plot_ctrav, icer_plot_ctreat, icer_plot_preval, icer_plot_sens, icer_plot_spec, icer_plot_ccom)
+
+cbPalette <- c("#009E73", "#CC79A7", "#56B4E9", "#999999", "#E69F00",  "#F0E442", "#0072B2", "#D55E00")
+scale_colour_manual(values=cbPalette)
+
+ggplot(dsa_plot,
+       aes(x = incremental_cost, y = incremental_effect, color = study_arm, pch = bound)) + 
+  geom_point(size=3) +
+  geom_hline(yintercept=0) +
+  geom_vline(xintercept=0) +
+  facet_wrap("param") +
+  labs(y = "Additional instances of trachoma indicators identified",
+       x = "Incremental cost per person surveyed (2022 USD)") +
+  guides(color = guide_legend(title = "Evaluation Method"), shape = guide_legend(title = "Parameter Value")) + scale_colour_manual(values=cbPalette) +
+  theme(text=element_text(size = 12), legend.title=element_text(size = 12)) + theme_bw() 
+
+```
+
+Percent Variation by Parameter
+```{r variation}
+# pull in base value, calculate difference between min and max, square that value, divide by sum of squared differences = % variation accounted for by that variable
+
+base_values_swab <- icer %>%
+  filter(study_arm=="swab")
+base_values_dbs <- icer %>%
+  filter(study_arm=="dbs")
+base_values_swabdbs <- icer %>%
+  filter(study_arm=="swab_dbs") %>%
+  mutate(study_arm=if_else(study_arm=="swab_dbs","swabdbs",study_arm))
+
+dsa_diff_swab <- dsa_final %>%
+  filter(study_arm=="swab") %>%
+  mutate(dsa_name=gsub("_min","",dsa_name),
+         dsa_name=gsub("_max","",dsa_name))%>%
+  group_by(dsa_name, param, bound) %>%
+  pivot_wider(id_cols = dsa_name, names_from = bound, values_from = icer,
+              names_glue = "{bound}_icer") %>%
+  mutate(diff_icer=max_icer-min_icer) %>%
+  rename("study_arm_param"=dsa_name)
+dsa_diff_dbs <- dsa_final %>%
+  filter(study_arm=="dbs") %>%
+  mutate(dsa_name=gsub("_min","",dsa_name),
+         dsa_name=gsub("_max","",dsa_name))%>%
+  group_by(dsa_name, param, bound) %>%
+  pivot_wider(id_cols = dsa_name, names_from = bound, values_from = icer,
+              names_glue = "{bound}_icer") %>%
+  mutate(diff_icer=max_icer-min_icer) %>%
+  rename("study_arm_param"=dsa_name)
+dsa_diff_swabdbs <- dsa_final %>%
+  filter(study_arm=="swabdbs") %>%
+  mutate(dsa_name=gsub("_min","",dsa_name),
+         dsa_name=gsub("_max","",dsa_name))%>%
+  group_by(dsa_name, param, bound) %>%
+  pivot_wider(id_cols = dsa_name, names_from = bound, values_from = icer,
+              names_glue = "{bound}_icer") %>%
+  mutate(diff_icer=max_icer-min_icer) %>%
+  rename("study_arm_param"=dsa_name)
+
+# pull in base values
+dsa_diff_swab$icer_base <- base_values_swab$icer
+dsa_diff_dbs$icer_base <- base_values_dbs$icer
+dsa_diff_swabdbs$icer_base <- base_values_swabdbs$icer
+
+dsa_diff_swab <- merge(model_params_dsa[, c("study_arm_param", "min", "max")],
+                  dsa_diff_swab) %>%
+  rename("param_low" = min, "param_high" = max)
+dsa_diff_dbs <- merge(model_params_dsa[, c("study_arm_param", "min", "max")],
+                  dsa_diff_dbs) %>%
+  rename("param_low" = min, "param_high" = max)
+dsa_diff_swabdbs <- merge(model_params_dsa[, c("study_arm_param", "min", "max")],
+                  dsa_diff_swabdbs) %>%
+  rename("param_low" = min, "param_high" = max)
+
+# calculate the proportion of variation explained by each variable, for each study arm
+dsa_diff_swab$spread <- abs(dsa_diff_swab$diff_icer)
+dsa_diff_swab$spread_sqr <- dsa_diff_swab$spread ^ 2
+dsa_diff_swab$pct_var <- dsa_diff_swab$spread_sqr / sum(dsa_diff_swab$spread_sqr)
+dsa_diff_swab <- dsa_diff_swab %>%
+  arrange(-pct_var, study_arm_param)
+
+dsa_diff_dbs$spread <- abs(dsa_diff_dbs$diff_icer)
+dsa_diff_dbs$spread_sqr <- dsa_diff_dbs$spread ^ 2
+dsa_diff_dbs$pct_var <- dsa_diff_dbs$spread_sqr / sum(dsa_diff_dbs$spread_sqr)
+dsa_diff_dbs <- dsa_diff_dbs %>%
+  arrange(-pct_var, study_arm_param)
+
+dsa_diff_swabdbs$spread <- abs(dsa_diff_swabdbs$diff_icer)
+dsa_diff_swabdbs$spread_sqr <- dsa_diff_swabdbs$spread ^ 2
+dsa_diff_swabdbs$pct_var <- dsa_diff_swabdbs$spread_sqr / sum(dsa_diff_swabdbs$spread_sqr)
+dsa_diff_swabdbs <- dsa_diff_swabdbs %>%
+  arrange(-pct_var, study_arm_param)
+
+# get the expected value
+dsa_diff_swab$ev_high <-  ifelse(dsa_diff_swab$max_icer > dsa_diff_swab$min_icer,
+                           dsa_diff_swab$max_icer, dsa_diff_swab$min_icer)
+dsa_diff_swab$ev_low <-  ifelse(dsa_diff_swab$max_icer > dsa_diff_swab$min_icer,
+                            dsa_diff_swab$min_icer, dsa_diff_swab$max_icer)
+
+dsa_diff_dbs$ev_high <-  ifelse(dsa_diff_dbs$max_icer > dsa_diff_dbs$min_icer,
+                           dsa_diff_dbs$max_icer, dsa_diff_dbs$min_icer)
+dsa_diff_dbs$ev_low <-  ifelse(dsa_diff_dbs$max_icer > dsa_diff_dbs$min_icer,
+                            dsa_diff_dbs$min_icer, dsa_diff_dbs$max_icer)
+
+dsa_diff_swabdbs$ev_high <-  ifelse(dsa_diff_swabdbs$max_icer > dsa_diff_swabdbs$min_icer,
+                           dsa_diff_swabdbs$max_icer, dsa_diff_swabdbs$min_icer)
+dsa_diff_swabdbs$ev_low <-  ifelse(dsa_diff_swabdbs$max_icer > dsa_diff_swabdbs$min_icer,
+                            dsa_diff_swabdbs$min_icer, dsa_diff_swabdbs$max_icer)
+```
+
+Probabilistic Sensitivity Analysis
+```{r psa, include = FALSE}
+model_params_psa <- as.data.frame(model_ranges)
+n_runs_psa <- 10000
+set.seed(24601)
+hypercube <- data.frame(randomLHS(n_runs_psa, nrow(model_params_psa)))
+names(hypercube) <- model_params_psa$study_arm_param
+
+get_simple_pert <- function(parameter) {
+    qpert(hypercube[, parameter], 
+          min = as.numeric(model_params_psa$min[model_params_psa$study_arm_param == parameter]), 
+          mode = as.numeric(model_params_psa$value[model_params_psa$study_arm_param == parameter]), 
+          max = as.numeric(model_params_psa$max[model_params_psa$study_arm_param == parameter]))
+  }
+  
+hypercube[, model_params_psa$study_arm_param] <- 
+  sapply(model_params_psa$study_arm_param, get_simple_pert)
+
+#setting prevalence to be constant across study arms
+hypercube$swab_preval = hypercube$grading_preval
+hypercube$dbs_preval = hypercube$grading_preval
+hypercube$swab_dbs_preval = hypercube$grading_preval
+
+psa_input <- for (i in 1:n_runs_psa) {
+  
+  model_params <- as.data.frame(model_ranges) 
+  
+  # replace the PSA parameters with the hypercube values from the given row
+  for (j in 1:ncol(hypercube)) {
+    model_params$value[model_params$study_arm_param == names(hypercube)[j]] <-
+      c(hypercube[i, j])
+  }
+  
+  hc_row <- i
+  model_params_psa_for_run <- model_params %>%
+    select(study_arm, parameter, value) %>%
+    pivot_wider(names_from = parameter, values_from = value) %>%
+      as.data.frame()
+    
+  psa_model <- calculate_icer(model_params_psa_for_run)
+  psa_model$hc_row <- hc_row
+  write.csv(psa_model, paste0("Model inputs/temp/output/psa_",
+                            sprintf("%04d", i), ".csv"),
+            row.names = FALSE)
+}
+
+```
+
+```{r read_in_psa}
+psa_path <- "Model inputs/temp/output/"
+
+psa_files <- list.files(psa_path)
+
+psa_final <- lapply(paste0(psa_path, psa_files), read.csv)
+
+psa_final <- do.call(rbind, psa_final)
+```
+
+```{r analyze_psa}
+#Quantile regression on test sensitivity and per diems
+
+psa_final$ln_sens = log(psa_final$sens)
+psa_final$abs_icer = abs(psa_final$icer)
+
+taus <- c(0.1,0.5,0.9)
+rqfit <-rq(abs_icer ~ ln_sens + c_pd, data=psa_final%>%filter(study_arm!="grading"), tau = taus)
+summary(rqfit)
+
+#Probabilistic Sensitivity Analysis Cost-Effectiveness Plane (Figure 4)
+psa_analyze <- psa_final %>%
+  filter(study_arm!="grading") %>%
+  mutate(study_arm=if_else(study_arm=="dbs", "DBS", study_arm),
+         study_arm=if_else(study_arm=="swab_dbs", "Swabs and DBS", study_arm),
+         study_arm=if_else(study_arm=="swab", "Swabs", study_arm)) %>%
+  pivot_longer(cols = 2:9,
+               names_to = "parameter") %>%
+  select(study_arm, parameter, value, incremental_cost, incremental_effect, icer, hc_row)
+
+cbPalette <- c("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#56B4E9", "#999999", "#E69F00",  "#F0E442")
+scale_colour_manual(values=cbPalette)
+
+ggplot(psa_analyze,
+       aes(x = incremental_cost, y = incremental_effect, color = study_arm)) + 
+  geom_point(size = 0.5) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  labs(y = "Additional instances of trachoma indicators identified",
+       x = "Incremental cost per person surveyed (2022 USD)") +
+  stat_ellipse(linewidth=2.5) +
+  guides(color = guide_legend(title = "Evaluation Method"))  + theme_bw() + 
+  theme(axis.text=element_text(size=14),axis.title=element_text(size=16), legend.text = element_text(size = 14),legend.title = element_text(size = 16)) +
+  scale_colour_manual(values=cbPalette)
+
+```
